@@ -369,6 +369,11 @@ class Node:
             self.dump.dump_text(f"Vote granted for Node {CId} in term {cTerm}.")
             self.voted_for = CId
             self.metadata.update_metadata("NodeID",CId)
+            # Granting a vote resets the election timer (Raft §5.2); otherwise a
+            # voter can time out before the new leader's first heartbeat arrives
+            # and start a needless competing election.
+            if self.current_role != "Leader":
+                self.stop_election_timeout()
             response.voteGranted = True
             response.nodeId = self.node_id
             response.term = self.current_term
@@ -582,7 +587,7 @@ class Node:
                         response = self.replicate_log(self.node_id, follower_id)
                         if response.success:
                             count_success += 1
-                    if count_success >= len(ALL_ADDRESSES) / 2:
+                    if count_success + 1 > len(ALL_ADDRESSES) / 2:  # +1: the leader itself
                         user_response.Success = True
                         user_response.Data = (
                             str(message.Request) + " successfully committed."
@@ -632,7 +637,7 @@ class Node:
                     count_success += 1
             print("♥ Successful Heartbeat Count:", count_success)
 
-            if count_success >= len(ALL_ADDRESSES) / 2:
+            if count_success + 1 > len(ALL_ADDRESSES) / 2:  # +1: the leader itself
                 self.renew_lease(self.max_lease_duration)
 
     # |--------------------------------------|
