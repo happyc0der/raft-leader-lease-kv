@@ -469,52 +469,60 @@ class Node:
     # |--------------------------------------|
 
     def replicate_log(self, leaderId, followerId):
-        if followerId not in self.sent_length.keys():
-            self.sent_length[followerId] = 0
-        prefixLen = self.sent_length[followerId]
-        suffix = [
-            self.log.get_entry(i) for i in range(prefixLen, self.log.get_length())
-        ]
+        # Log repair backs sentLength off one entry per rejected AppendEntries.
+        # Retry in a loop until the follower accepts or recieve_log_ack says to
+        # stop (we are no longer leader, or the term changed); recursing through
+        # recieve_log_ack instead overflowed the stack for a follower ~500
+        # entries behind.
+        while True:
+            if followerId not in self.sent_length.keys():
+                self.sent_length[followerId] = 0
+            prefixLen = self.sent_length[followerId]
+            suffix = [
+                self.log.get_entry(i) for i in range(prefixLen, self.log.get_length())
+            ]
 
-        prefixTerm = 0
-        if prefixLen > 0:
-            prefixTerm = self.log.get_entry(prefixLen - 1)[1]
+            prefixTerm = 0
+            if prefixLen > 0:
+                prefixTerm = self.log.get_entry(prefixLen - 1)[1]
 
-        suffix_entry = raft_pb2.Entry()
-        for entry in suffix:
-            suffix_entry.commands.append(f"{entry[0]} {entry[1]}")
+            suffix_entry = raft_pb2.Entry()
+            for entry in suffix:
+                suffix_entry.commands.append(f"{entry[0]} {entry[1]}")
 
-        append_entry_request = raft_pb2.AppendEntryRequest(
-            term=self.current_term,
-            leaderId=leaderId,
-            prevLogIndex=prefixLen,
-            prevLogTerm=prefixTerm,
-            entries=suffix_entry,
-            leaderCommit=self.commit_length,
-            leaseDuration=self.max_lease_duration,
-        )
+            append_entry_request = raft_pb2.AppendEntryRequest(
+                term=self.current_term,
+                leaderId=leaderId,
+                prevLogIndex=prefixLen,
+                prevLogTerm=prefixTerm,
+                entries=suffix_entry,
+                leaderCommit=self.commit_length,
+                leaseDuration=self.max_lease_duration,
+            )
 
-        try:
-            response = call_peer(followerId, "appendEntry", append_entry_request)
-            print(f"✅ Log replicated to Node-{followerId}")
-        except Exception as e:
-            self.dump.dump_text(f"Error occurred while sending RPC to Node {followerId}.")
-            print("❌ Error sending request to:", ALL_ADDRESSES[followerId])
-            response = raft_pb2.AppendEntryResponse()
-            response.term = self.current_term
-            response.success = False
-            response.nodeId = self.node_id
-            response.ack = 0
-            return response
+            try:
+                response = call_peer(followerId, "appendEntry", append_entry_request)
+                print(f"✅ Log replicated to Node-{followerId}")
+            except Exception as e:
+                self.dump.dump_text(f"Error occurred while sending RPC to Node {followerId}.")
+                print("❌ Error sending request to:", ALL_ADDRESSES[followerId])
+                response = raft_pb2.AppendEntryResponse()
+                response.term = self.current_term
+                response.success = False
+                response.nodeId = self.node_id
+                response.ack = 0
+                return response
 
-        self.recieve_log_ack(
-            response.nodeId, response.term, response.ack, response.success
-        )
-
-        return response
+            retry = self.recieve_log_ack(
+                response.nodeId, response.term, response.ack, response.success
+            )
+            if not retry:
+                return response
 
     def recieve_log_ack(self, follower, term, ack, success):
         # Function 8 out of 9
+        # Returns True when the follower rejected the entries and sentLength was
+        # decremented, so replicate_log should send again from the earlier index.
         if term == self.current_term and self.current_role == "Leader":
             if success == True and ack >= self.acked_length[follower]:
                 self.sent_length[follower] = ack
@@ -522,7 +530,7 @@ class Node:
                 self.commit_log_entries()
             elif self.sent_length[follower] > 0:
                 self.sent_length[follower] -= 1
-                self.replicate_log(self.node_id, follower)
+                return True
         elif term > self.current_term:
             self.current_term = term
             self.metadata.update_metadata("Term",self.current_term)
@@ -531,6 +539,7 @@ class Node:
             self.voted_for = None
             self.metadata.update_metadata("NodeID","NA")
             self.stop_election_timeout()
+        return False
 
     def set_of_acks(self, length):
         # Helper Function 9 out of 9

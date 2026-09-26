@@ -172,6 +172,13 @@ below is from a real run on Windows 11 with Python 3.13:
 Each log entry is stored as `<command> <term>`. The `NO-OP 2` entry is the no-op the new leader
 appended in term 2.
 
+There is also a quick in-process regression test for log repair. It runs in a few seconds and
+starts no processes:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Running a cluster by hand
 
 Run these commands from the repository root with the virtual environment active. Each node
@@ -283,6 +290,7 @@ python -m grpc_tools.protoc -I src/ProtoBufs --python_out=src --pyi_out=src --gr
 │   ├── raft_pb2*.py[i]      # Generated protobuf / gRPC code
 │   └── test.py              # Scratch check of LeaseTimer.time_left()
 ├── scripts/demo_cluster.py  # End-to-end smoke test: election, replication, failover, catch-up
+├── tests/test_log_repair.py # Unit test: a leader repairs a follower 1500 entries behind
 ├── images/RPCs.png          # RPC summary (Raft paper, Figure 2)
 ├── requirements.txt         # grpcio, protobuf
 └── requirements-dev.txt     # + grpcio-tools for regenerating stubs
@@ -330,6 +338,10 @@ current Python and gRPC releases:
   - The step-down on a higher-term vote reply could never run.
   - Majority checks did not count the leader itself.
   - A voter did not reset its election timer after granting a vote.
+  - Log repair recursed once per missing entry (`replicate_log` and `recieve_log_ack` called
+    each other), so a follower about 500 entries behind hit Python's recursion limit. The error
+    was reported as a failed RPC, and heartbeats to that follower failed until it caught up. The
+    leader now retries in a loop.
 - Added RPC deadlines and removed a busy-wait loop.
 - Added the demo script, `requirements.txt` and this README.
 
