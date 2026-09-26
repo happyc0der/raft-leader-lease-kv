@@ -1,7 +1,8 @@
 from google.protobuf.internal import containers as _containers
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
-from typing import ClassVar as _ClassVar, Iterable as _Iterable, Mapping as _Mapping, Optional as _Optional, Union as _Union
+from collections.abc import Iterable as _Iterable, Mapping as _Mapping
+from typing import ClassVar as _ClassVar, Optional as _Optional, Union as _Union
 
 DESCRIPTOR: _descriptor.FileDescriptor
 
@@ -39,7 +40,7 @@ class AppendEntryResponse(_message.Message):
     success: bool
     nodeId: int
     ack: int
-    def __init__(self, term: _Optional[int] = ..., success: bool = ..., nodeId: _Optional[int] = ..., ack: _Optional[int] = ...) -> None: ...
+    def __init__(self, term: _Optional[int] = ..., success: _Optional[bool] = ..., nodeId: _Optional[int] = ..., ack: _Optional[int] = ...) -> None: ...
 
 class RequestVoteRequest(_message.Message):
     __slots__ = ("term", "candidateId", "lastLogIndex", "lastLogTerm")
@@ -60,10 +61,10 @@ class RequestVoteResponse(_message.Message):
     NODEID_FIELD_NUMBER: _ClassVar[int]
     LEASEDURATION_FIELD_NUMBER: _ClassVar[int]
     term: int
-    voteGranted: int
+    voteGranted: bool
     nodeId: int
     leaseDuration: float
-    def __init__(self, term: _Optional[int] = ..., voteGranted: _Optional[int] = ..., nodeId: _Optional[int] = ..., leaseDuration: _Optional[float] = ...) -> None: ...
+    def __init__(self, term: _Optional[int] = ..., voteGranted: _Optional[bool] = ..., nodeId: _Optional[int] = ..., leaseDuration: _Optional[float] = ...) -> None: ...
 
 class ServeClientArgs(_message.Message):
     __slots__ = ("Request",)
@@ -79,4 +80,4 @@ class ServeClientReply(_message.Message):
     Data: str
     LeaderID: str
     Success: bool
-    def __init__(self, Data: _Optional[str] = ..., LeaderID: _Optional[str] = ..., Success: bool = ...) -> None: ...
+    def __init__(self, Data: _Optional[str] = ..., LeaderID: _Optional[str] = ..., Success: _Optional[bool] = ...) -> None: ...
