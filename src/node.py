@@ -1,7 +1,8 @@
+import argparse
 import concurrent.futures as futures
 import os
+import random
 import signal, sys
-import numpy as np
 import threading
 import grpc
 import raft_pb2_grpc
@@ -9,12 +10,22 @@ import raft_pb2
 import time
 import custom_timer
 from metadata import metadump
+from cluster_config import parse_cluster, DEFAULT_CLUSTER
+
+# Emoji-heavy logging must not crash when stdout is redirected on Windows (cp1252).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # |--------------------------------------|
 # | DEVELOPMENT VARIABLES                |
 # |--------------------------------------|
 
 lock = threading.Lock()
 lease_lock = threading.Lock()
+
+# Deadline (seconds) for every node-to-node RPC so that a dead or hung peer
+# cannot block the heartbeat / election loop indefinitely.
+RPC_TIMEOUT = 1.0
 
 
 def signal_handler(signal, frame):
@@ -24,10 +35,31 @@ def signal_handler(signal, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
-ID = int(input("ENTER ID:"))
-ALL_PORTS = [4040, 4041, 4042, 4043,4044]
-PORT = str(ALL_PORTS[ID])
-OTHER_IDS = [i for i in range(len(ALL_PORTS)) if i != ID]
+# Cluster membership is filled in by configure() from the command line
+# (--id / --cluster) or the RAFT_CLUSTER environment variable.
+ID = None
+ALL_ADDRESSES = []  # "host:port" of every node, indexed by node id
+PORT = None
+OTHER_IDS = []
+DATA_DIR = "."
+
+
+def configure(node_id, addresses, data_dir="."):
+    global ID, ALL_ADDRESSES, PORT, OTHER_IDS, DATA_DIR
+    if not 0 <= node_id < len(addresses):
+        raise SystemExit(f"Node id {node_id} is out of range for a {len(addresses)}-node cluster")
+    ID = node_id
+    ALL_ADDRESSES = addresses
+    PORT = addresses[node_id].rsplit(":", 1)[1]
+    OTHER_IDS = [i for i in range(len(addresses)) if i != node_id]
+    DATA_DIR = data_dir
+
+
+def call_peer(node_id, method_name, request, timeout=RPC_TIMEOUT):
+    """Invoke an RPC on another node over a short-lived channel with a deadline."""
+    with grpc.insecure_channel(ALL_ADDRESSES[node_id]) as channel:
+        stub = raft_pb2_grpc.raft_serviceStub(channel)
+        return getattr(stub, method_name)(request, timeout=timeout)
 
 # |--------------------------------------|
 # | gRPC SERVICER CLASS                  |
@@ -62,7 +94,7 @@ class Log:
     def __init__(self, log_file_path):
         self.entries = []
         self.log_file_path = log_file_path
-        with open(self.log_file_path, "r") as f:
+        with open(self.log_file_path, "r", encoding="utf-8") as f:
             for line in f:
                 parsed_entry = line.strip().split(" ")
                 command, term = " ".join(parsed_entry[:-1]), parsed_entry[-1]
@@ -102,18 +134,18 @@ class Log:
 
     def dump_log(self):
         open(self.log_file_path, "w").close()
-        with open(self.log_file_path, "w") as f:
+        with open(self.log_file_path, "w", encoding="utf-8") as f:
             for entry in self.entries:
                 f.write(str(entry[0]) + " " + str(entry[1]) + "\n")
             f.close()
 
     def dump_text(self,text):
-        with open(self.log_file_path, "a") as f:
+        with open(self.log_file_path, "a", encoding="utf-8") as f:
             f.write(text + "\n")
             f.close()
     
     def rewrite_log(self,text):
-        with open(self.log_file_path, "w") as f:
+        with open(self.log_file_path, "w", encoding="utf-8") as f:
             f.write(text + "\n")
             f.close()
 
@@ -168,15 +200,15 @@ class Node:
         self.votes_recieved = set()
         self.sent_length = {}
         self.acked_length = {}
-        self.election_timeout = np.random.uniform(5, 11)
+        self.election_timeout = random.uniform(5, 11)
         self.election_timer = threading.Timer(
             self.election_timeout, self.handle_election_timeout
         )
-        if not os.path.exists("./logs_node_" + str(self.node_id)):
-            os.mkdir("./logs_node_" + str(self.node_id))
-        self.log_file_path = "./logs_node_" + str(self.node_id) + "/logs.txt"
-        self.dump_file_path = "./logs_node_" + str(self.node_id) + "/dump.txt"
-        self.metadata_file_path = "./logs_node_" + str(self.node_id) + "/metadata.txt"
+        node_dir = os.path.join(DATA_DIR, "logs_node_" + str(self.node_id))
+        os.makedirs(node_dir, exist_ok=True)
+        self.log_file_path = os.path.join(node_dir, "logs.txt")
+        self.dump_file_path = os.path.join(node_dir, "dump.txt")
+        self.metadata_file_path = os.path.join(node_dir, "metadata.txt")
         self.election_timer_alive = False
         if not os.path.exists(self.log_file_path):
             open(self.log_file_path, "w").close()
@@ -230,6 +262,9 @@ class Node:
             elif self.current_role == "Leader":
                 self.heartbeat()
                 time.sleep(1)
+                continue
+            # Avoid spinning a CPU core at 100% while waiting on a timer.
+            time.sleep(0.05)
 
     def start_server(self):
         print("PID:", os.getpid())
@@ -349,9 +384,10 @@ class Node:
     def send_request_vote(self):
         print("🗳  Requesting votes...")
         request_vote_request = raft_pb2.RequestVoteRequest()
-        self.voted_for = self.node_id 
+        self.voted_for = self.node_id
         self.metadata.update_metadata("NodeID",self.voted_for)
-        self.votes_recieved.add(self.node_id)
+        # Votes only count for the term they were cast in: start every election afresh.
+        self.votes_recieved = {self.node_id}
         self.current_term = self.current_term + 1
         self.metadata.update_metadata("Term",self.current_term)
         last_term = 0
@@ -365,9 +401,7 @@ class Node:
         self.lease_duration = 0
         for ID in OTHER_IDS:
             try:
-                channel = grpc.insecure_channel("localhost:" + str(ALL_PORTS[ID]))
-                stub = raft_pb2_grpc.raft_serviceStub(channel)
-                response = stub.requestVote(request_vote_request)
+                response = call_peer(ID, "requestVote", request_vote_request)
                 responses[response.nodeId] = response
                 if (
                     self.lease_timer
@@ -379,7 +413,7 @@ class Node:
                 self.handle_vote_reponse(response)
             except:
                 self.dump.dump_text(f"Error occurred while sending RPC to Node {ID}.")
-                print("❌ Error sending request to port:", str(ALL_PORTS[ID]))
+                print("❌ Error sending request to:", ALL_ADDRESSES[ID])
 
         if self.current_role == "Candidate":
             self.start_election_timeout()
@@ -395,7 +429,7 @@ class Node:
             and responder_vote_granted
         ):
             self.votes_recieved.add(responder_id)
-            if len(self.votes_recieved) > len(ALL_PORTS) / 2:
+            if len(self.votes_recieved) > len(ALL_ADDRESSES) / 2:
 
                 self.current_role = "Leader"
                 self.current_leader = self.node_id
@@ -415,16 +449,15 @@ class Node:
                         self.acked_length[ID] = 0
                         self.replicate_log(self.current_leader, ID)
                     except:
-                        print("❌ Error sending request to port:", ALL_PORTS[ID])
-            elif responder_term > self.current_term:
-                self.current_term = responder_term
-                self.metadata.update_metadata("Term",self.current_term)
-                self.current_role = "Follower"
-                self.voted_for = None
-                self.metadata.update_metadata("NodeID","NA")
-                self.stop_election_timeout()
-        else:
-            pass
+                        print("❌ Error sending request to:", ALL_ADDRESSES[ID])
+        elif responder_term > self.current_term:
+            # A voter is ahead of us: adopt its term and step back to follower.
+            self.current_term = responder_term
+            self.metadata.update_metadata("Term",self.current_term)
+            self.current_role = "Follower"
+            self.voted_for = None
+            self.metadata.update_metadata("NodeID","NA")
+            self.stop_election_timeout()
 
     # |--------------------------------------|
     # | LEADER FUNCTIONALITY                 |
@@ -457,13 +490,11 @@ class Node:
         )
 
         try:
-            channel = grpc.insecure_channel(f"localhost:{ALL_PORTS[followerId]}")
-            stub = raft_pb2_grpc.raft_serviceStub(channel)
-            response = stub.appendEntry(append_entry_request)
+            response = call_peer(followerId, "appendEntry", append_entry_request)
             print(f"✅ Log replicated to Node-{followerId}")
         except Exception as e:
             self.dump.dump_text(f"Error occurred while sending RPC to Node {followerId}.")
-            print("❌ Error sending request to port:", str(ALL_PORTS[followerId]))
+            print("❌ Error sending request to:", ALL_ADDRESSES[followerId])
             response = raft_pb2.AppendEntryResponse()
             response.term = self.current_term
             response.success = False
@@ -506,10 +537,11 @@ class Node:
 
     def commit_log_entries(self):
         # Function 9 out of 9
-        minacks = len(ALL_PORTS) / 2
+        # An entry is committed once a majority of the cluster stores it; the
+        # leader always has its own entries, so count it alongside follower acks.
         ready = []
         for i in range(1, self.log.get_length() + 1):
-            if self.set_of_acks(i) >= minacks:
+            if self.set_of_acks(i) + 1 > len(ALL_ADDRESSES) / 2:
                 ready.append(i)
         if (
             len(ready) > 0
@@ -550,34 +582,40 @@ class Node:
                         response = self.replicate_log(self.node_id, follower_id)
                         if response.success:
                             count_success += 1
-                    if count_success >= len(ALL_PORTS) / 2:
+                    if count_success >= len(ALL_ADDRESSES) / 2:
                         user_response.Success = True
                         user_response.Data = (
                             str(message.Request) + " successfully committed."
                         )
                         self.dump.dump_text(f"Node {self.node_id} (leader) received an {message.Request} request.")
-                        
-                    
+                    else:
+                        user_response.Success = False
+                        user_response.Data = "Could not replicate to a majority of nodes."
+
+
 
             print("✉️  Returning response to user", user_response)
             return user_response
 
         else:
             print("📝  Recieved client request...")
-            print("⏩ Redirecting to Leader-", self.current_leader)
+            leader = self.current_leader
+            if leader is None or leader == self.node_id:
+                user_response.LeaderID = "None"
+                user_response.Success = False
+                user_response.Data = "No leader known yet; retry shortly."
+                return user_response
+            print("⏩ Redirecting to Leader-", leader)
             try:
-                channel = grpc.insecure_channel(
-                    "localhost:" + str(ALL_PORTS[self.current_leader])
-                )
-                stub = raft_pb2_grpc.raft_serviceStub(channel)
-                response = stub.serveClient(message)
-                print("📝  Response from Leader-", self.current_leader, ":", response)
+                # SET waits for replication to every follower, so allow more time.
+                response = call_peer(leader, "serveClient", message, timeout=15)
+                print("📝  Response from Leader-", leader, ":", response)
                 return response
             except:
-                print(
-                    "❌ Error forwarding request to leader port:",
-                    str(ALL_PORTS[self.current_leader]),
-                )
+                print("❌ Error forwarding request to leader:", ALL_ADDRESSES[leader])
+                user_response.Success = False
+                user_response.Data = f"Could not reach leader {leader}; retry shortly."
+                return user_response
 
     def heartbeat(self):
         if self.current_role == "Leader":
@@ -594,7 +632,7 @@ class Node:
                     count_success += 1
             print("♥ Successful Heartbeat Count:", count_success)
 
-            if count_success >= len(ALL_PORTS) / 2:
+            if count_success >= len(ALL_ADDRESSES) / 2:
                 self.renew_lease(self.max_lease_duration)
 
     # |--------------------------------------|
@@ -663,6 +701,27 @@ class Node:
         return
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run one node of the Raft key-value cluster.")
+    parser.add_argument(
+        "--id", type=int, help="this node's index in the cluster list (prompted for if omitted)"
+    )
+    parser.add_argument(
+        "--cluster",
+        help="comma-separated host:port of every node, in id order "
+        f"(default: $RAFT_CLUSTER or {DEFAULT_CLUSTER})",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=os.environ.get("RAFT_DATA_DIR", "."),
+        help="directory that holds logs_node_<id>/ (default: $RAFT_DATA_DIR or the current directory)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
+    node_id = args.id if args.id is not None else int(input("ENTER ID:"))
+    configure(node_id, parse_cluster(args.cluster), args.data_dir)
     node = Node()
     node.initialize_node(ID)

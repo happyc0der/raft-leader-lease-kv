@@ -4,7 +4,7 @@ class metadump():
     
     def read_metadata(self):
         metadata = {}
-        with open(self.file_path, 'r') as file:
+        with open(self.file_path, 'r', encoding='utf-8') as file:
             for line in file:
                 if '=' in line:
                     key, value = line.strip().split('=')
@@ -12,9 +12,9 @@ class metadump():
         return metadata
 
     def update_metadata(self, key, value):
-        with open(self.file_path, 'r') as file:
+        with open(self.file_path, 'r', encoding='utf-8') as file:
             lines = file.readlines()
-        with open(self.file_path, 'w') as file:
+        with open(self.file_path, 'w', encoding='utf-8') as file:
             for line in lines:
                 if line.startswith(key):
                     file.write(f"{key} = {value}\n")
@@ -22,7 +22,7 @@ class metadump():
                     file.write(line)
     
     def write_blank_metadata_file(self):
-        with open(self.file_path, 'w') as file:
+        with open(self.file_path, 'w', encoding='utf-8') as file:
             file.write("# Metadata File\n\n")
             file.write("# Variable values\n")
             file.write("commitLength = NA\n")
