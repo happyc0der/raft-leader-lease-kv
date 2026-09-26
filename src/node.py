@@ -690,7 +690,7 @@ class Node:
         # Function 7 out of 9
         if len(suffix) > 0 and self.log.get_length() > prefixLen:
             index = min(self.log.get_length(), prefixLen + len(suffix)) - 1
-            if self.log.get_entry(index)[1] != suffix[index - prefixLen].split()[-1]:
+            if self.log.get_entry(index)[1] != int(suffix[index - prefixLen].split()[-1]):
                 self.log.modify_log(self.log.get_entries()[0:prefixLen])
         if prefixLen + len(suffix) > self.log.get_length():
             for i in range(self.log.get_length() - prefixLen, len(suffix)):
