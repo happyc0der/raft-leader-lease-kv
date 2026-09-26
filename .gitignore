@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Runtime state written by the nodes (log, metadata and event dump per node)
+logs_node_*/
+node_*.out
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
